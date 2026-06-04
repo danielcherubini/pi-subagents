@@ -22,7 +22,7 @@ import { discoverAgents } from "../agents/agents.ts";
 import { cleanupAllArtifactDirs, cleanupOldArtifacts, getArtifactsDir } from "../shared/artifacts.ts";
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
 import { cleanupOldChainDirs } from "../shared/settings.ts";
-import { renderWidget, renderSubagentResult, stopResultAnimations, stopWidgetAnimation, syncResultAnimation } from "../tui/render.ts";
+import { clearLegacyResultAnimationTimer, renderWidget, renderSubagentResult } from "../tui/render.ts";
 import { SubagentParams } from "./schemas.ts";
 import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
@@ -33,11 +33,12 @@ import { registerSlashSubagentBridge } from "../slash/slash-bridge.ts";
 import { clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails, restoreSlashFinalSnapshots, type SlashMessageDetails } from "../slash/slash-live-state.ts";
 import { inspectSubagentStatus } from "../runs/background/run-status.ts";
 import registerSubagentNotify, { type SubagentNotifyDetails } from "../runs/background/notify.ts";
-import { SUBAGENT_CHILD_ENV } from "../runs/shared/pi-args.ts";
+import { SUBAGENT_CHILD_ENV, SUBAGENT_FANOUT_CHILD_ENV } from "../runs/shared/pi-args.ts";
+import registerFanoutChildSubagentExtension from "./fanout-child.ts";
 import { formatDuration, shortenPath } from "../shared/formatters.ts";
+import { loadConfig } from "./config.ts";
 import {
 	type Details,
-	type ExtensionConfig,
 	type SubagentState,
 	ASYNC_DIR,
 	DEFAULT_ARTIFACT_CONFIG,
@@ -56,6 +57,8 @@ import {
 	type SubagentControlMessageDetails,
 } from "./control-notices.ts";
 
+export { loadConfig } from "./config.ts";
+
 /**
  * Derive subagent session base directory from parent session file.
  * If parent session is ~/.pi/agent/sessions/abc123.jsonl,
@@ -70,18 +73,6 @@ function getSubagentSessionRoot(parentSessionFile: string | null): string {
 		return path.join(sessionsDir, baseName);
 	}
 	return fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-session-"));
-}
-
-function loadConfig(): ExtensionConfig {
-	const configPath = path.join(os.homedir(), ".pi", "agent", "extensions", "subagent", "config.json");
-	try {
-		if (fs.existsSync(configPath)) {
-			return JSON.parse(fs.readFileSync(configPath, "utf-8")) as ExtensionConfig;
-		}
-	} catch (error) {
-		console.error(`Failed to load subagent config from '${configPath}':`, error);
-	}
-	return {};
 }
 
 function expandTilde(p: string): string {
@@ -142,14 +133,11 @@ function createSlashResultComponent(
 	details: SlashMessageDetails,
 	options: { expanded: boolean },
 	theme: ExtensionContext["ui"]["theme"],
-	requestRender: () => void,
 ): Container {
 	const container = new Container();
-	const animationState: { subagentResultAnimationTimer?: ReturnType<typeof setInterval> } = {};
 	let lastVersion = -1;
 	container.render = (width: number): string[] => {
 		const snapshot = getSlashRenderableSnapshot(details);
-		syncResultAnimation(snapshot.result, { state: animationState, invalidate: requestRender });
 		if (snapshot.version !== lastVersion || isSlashResultRunning(snapshot.result)) {
 			lastVersion = snapshot.version;
 			rebuildSlashResultContainer(container, snapshot.result, options, theme);
@@ -220,7 +208,10 @@ class SubagentControlNoticeComponent implements Component {
 }
 
 export default function registerSubagentExtension(pi: ExtensionAPI): void {
-	if (process.env[SUBAGENT_CHILD_ENV] === "1") return;
+	if (process.env[SUBAGENT_CHILD_ENV] === "1") {
+		if (process.env[SUBAGENT_FANOUT_CHILD_ENV] === "1") registerFanoutChildSubagentExtension(pi);
+		return;
+	}
 	const globalStore = globalThis as Record<string, unknown>;
 	const runtimeCleanupStoreKey = "__piSubagentRuntimeCleanup";
 	const previousRuntimeCleanup = globalStore[runtimeCleanupStoreKey];
@@ -271,8 +262,6 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	primeExistingResults();
 
 	const runtimeCleanup = () => {
-		stopWidgetAnimation();
-		stopResultAnimations();
 		stopResultWatcher();
 		clearPendingForegroundControlNotices(state);
 		if (state.poller) {
@@ -297,7 +286,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	pi.registerMessageRenderer<SlashMessageDetails>(SLASH_RESULT_TYPE, (message, options, theme) => {
 		const details = resolveSlashMessageDetails(message.details);
 		if (!details) return undefined;
-		return createSlashResultComponent(details, options, theme, () => state.lastUiContext?.ui.requestRender?.());
+		return createSlashResultComponent(details, options, theme);
 	});
 
 	pi.registerMessageRenderer<SubagentNotifyDetails>("subagent-notify", (message, options, theme) => {
@@ -466,7 +455,7 @@ DIAGNOSTICS:
 		},
 
 		renderResult(result, options, theme, context) {
-			syncResultAnimation(result, context);
+			clearLegacyResultAnimationTimer(context);
 			return renderSubagentResult(result, options, theme);
 		},
 
@@ -514,6 +503,7 @@ DIAGNOSTICS:
 		state.lastUiContext = ctx;
 		if (state.asyncJobs.size > 0) {
 			renderWidget(ctx, Array.from(state.asyncJobs.values()));
+			ctx.ui.requestRender?.();
 			ensurePoller();
 		}
 	});
@@ -569,8 +559,6 @@ DIAGNOSTICS:
 		slashBridge.dispose();
 		promptTemplateBridge.cancelAll();
 		promptTemplateBridge.dispose();
-		stopWidgetAnimation();
-		stopResultAnimations();
 		if (globalStore[runtimeCleanupStoreKey] === runtimeCleanup) {
 			delete globalStore[runtimeCleanupStoreKey];
 		}

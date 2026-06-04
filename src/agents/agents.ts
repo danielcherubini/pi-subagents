@@ -6,9 +6,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { OutputMode } from "../shared/types.ts";
+import type { AcceptanceInput, OutputMode } from "../shared/types.ts";
+import { getAgentDir } from "../shared/utils.ts";
 import { KNOWN_FIELDS } from "./agent-serializer.ts";
-import { parseChain } from "./chain-serializer.ts";
+import { parseChain, parseJsonChain } from "./chain-serializer.ts";
 import { mergeAgentsForScope } from "./agent-selection.ts";
 import { parseFrontmatter } from "./frontmatter.ts";
 import { buildRuntimeName, parsePackageName } from "./identity.ts";
@@ -45,6 +46,7 @@ export interface BuiltinAgentOverrideBase {
 	skills?: string[];
 	tools?: string[];
 	mcpDirectTools?: string[];
+	completionGuard?: boolean;
 }
 
 interface BuiltinAgentOverrideConfig {
@@ -59,6 +61,7 @@ interface BuiltinAgentOverrideConfig {
 	systemPrompt?: string;
 	skills?: string[] | false;
 	tools?: string[] | false;
+	completionGuard?: boolean;
 }
 
 interface BuiltinAgentOverrideInfo {
@@ -91,6 +94,7 @@ export interface AgentConfig {
 	defaultProgress?: boolean;
 	interactive?: boolean;
 	maxSubagentDepth?: number;
+	completionGuard?: boolean;
 	disabled?: boolean;
 	extraFields?: Record<string, string>;
 	override?: BuiltinAgentOverrideInfo;
@@ -104,14 +108,25 @@ interface SubagentSettings {
 const EMPTY_SUBAGENT_SETTINGS: SubagentSettings = { overrides: {} };
 
 export interface ChainStepConfig {
-	agent: string;
-	task: string;
+	agent?: string;
+	task?: string;
+	phase?: string;
+	label?: string;
+	as?: string;
+	outputSchema?: string | Record<string, unknown>;
 	output?: string | false;
 	outputMode?: OutputMode;
 	reads?: string[] | false;
 	model?: string;
 	skills?: string[] | false;
 	progress?: boolean;
+	parallel?: unknown;
+	expand?: unknown;
+	collect?: unknown;
+	concurrency?: number;
+	failFast?: boolean;
+	worktree?: boolean;
+	acceptance?: AcceptanceInput;
 }
 
 export interface ChainConfig {
@@ -125,13 +140,19 @@ export interface ChainConfig {
 	extraFields?: Record<string, string>;
 }
 
+export interface ChainDiscoveryDiagnostic {
+	source: "user" | "project";
+	filePath: string;
+	error: string;
+}
+
 interface AgentDiscoveryResult {
 	agents: AgentConfig[];
 	projectAgentsDir: string | null;
 }
 
 function getUserChainDir(): string {
-	return path.join(os.homedir(), ".pi", "agent", "chains");
+	return path.join(getAgentDir(), "chains");
 }
 
 function splitToolList(rawTools: string[] | undefined): { tools?: string[]; mcpDirectTools?: string[] } {
@@ -182,6 +203,7 @@ function cloneOverrideBase(agent: AgentConfig): BuiltinAgentOverrideBase {
 		skills: agent.skills ? [...agent.skills] : undefined,
 		tools: agent.tools ? [...agent.tools] : undefined,
 		mcpDirectTools: agent.mcpDirectTools ? [...agent.mcpDirectTools] : undefined,
+		completionGuard: agent.completionGuard,
 	};
 }
 
@@ -200,6 +222,7 @@ function cloneOverrideValue(override: BuiltinAgentOverrideConfig): BuiltinAgentO
 		...(override.systemPrompt !== undefined ? { systemPrompt: override.systemPrompt } : {}),
 		...(override.skills !== undefined ? { skills: override.skills === false ? false : [...override.skills] } : {}),
 		...(override.tools !== undefined ? { tools: override.tools === false ? false : [...override.tools] } : {}),
+		...(override.completionGuard !== undefined ? { completionGuard: override.completionGuard } : {}),
 	};
 }
 
@@ -217,7 +240,7 @@ function findNearestProjectRoot(cwd: string): string | null {
 }
 
 function getUserAgentSettingsPath(): string {
-	return path.join(os.homedir(), ".pi", "agent", "settings.json");
+	return path.join(getAgentDir(), "settings.json");
 }
 
 function getProjectAgentSettingsPath(cwd: string): string | null {
@@ -336,6 +359,14 @@ function parseBuiltinOverrideEntry(
 		}
 	}
 
+	if ("completionGuard" in input) {
+		if (typeof input.completionGuard === "boolean") {
+			override.completionGuard = input.completionGuard;
+		} else {
+			throw new Error(`Builtin override '${name}' in '${filePath}' has invalid 'completionGuard'; expected a boolean.`);
+		}
+	}
+
 	if ("systemPrompt" in input) {
 		if (typeof input.systemPrompt === "string") override.systemPrompt = input.systemPrompt;
 		else throw new Error(`Builtin override '${name}' in '${filePath}' has invalid 'systemPrompt'; expected a string.`);
@@ -408,6 +439,7 @@ function applyBuiltinOverride(
 		next.tools = tools;
 		next.mcpDirectTools = mcpDirectTools;
 	}
+	if (override.completionGuard !== undefined) next.completionGuard = override.completionGuard;
 
 	return next;
 }
@@ -447,7 +479,7 @@ function applyBuiltinOverrides(
 
 export function buildBuiltinOverrideConfig(
 	base: BuiltinAgentOverrideBase,
-	draft: Pick<AgentConfig, "model" | "fallbackModels" | "thinking" | "systemPromptMode" | "inheritProjectContext" | "inheritSkills" | "defaultContext" | "disabled" | "systemPrompt" | "skills" | "tools" | "mcpDirectTools">,
+	draft: Pick<AgentConfig, "model" | "fallbackModels" | "thinking" | "systemPromptMode" | "inheritProjectContext" | "inheritSkills" | "defaultContext" | "disabled" | "systemPrompt" | "skills" | "tools" | "mcpDirectTools" | "completionGuard">,
 ): BuiltinAgentOverrideConfig | undefined {
 	const override: BuiltinAgentOverrideConfig = {};
 
@@ -465,6 +497,9 @@ export function buildBuiltinOverrideConfig(
 	const baseTools = joinToolList(base);
 	const draftTools = joinToolList(draft);
 	if (!arraysEqual(draftTools, baseTools)) override.tools = draftTools ? [...draftTools] : false;
+	if ((draft.completionGuard !== false) !== (base.completionGuard !== false)) {
+		override.completionGuard = draft.completionGuard !== false;
+	}
 
 	return Object.keys(override).length > 0 ? override : undefined;
 }
@@ -517,7 +552,7 @@ export function removeBuiltinAgentOverride(cwd: string, name: string, scope: "us
 	return filePath;
 }
 
-function listMarkdownFilesRecursive(dir: string, predicate: (fileName: string) => boolean): string[] {
+function listFilesRecursive(dir: string, predicate: (fileName: string) => boolean): string[] {
 	const files: string[] = [];
 	if (!fs.existsSync(dir)) return files;
 
@@ -531,7 +566,7 @@ function listMarkdownFilesRecursive(dir: string, predicate: (fileName: string) =
 	for (const entry of entries) {
 		const filePath = path.join(dir, entry.name);
 		if (entry.isDirectory()) {
-			files.push(...listMarkdownFilesRecursive(filePath, predicate));
+			files.push(...listFilesRecursive(filePath, predicate));
 			continue;
 		}
 		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
@@ -544,7 +579,7 @@ function listMarkdownFilesRecursive(dir: string, predicate: (fileName: string) =
 function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
-	for (const filePath of listMarkdownFilesRecursive(dir, (fileName) => fileName.endsWith(".md") && !fileName.endsWith(".chain.md"))) {
+	for (const filePath of listFilesRecursive(dir, (fileName) => fileName.endsWith(".md") && !fileName.endsWith(".chain.md"))) {
 		let content: string;
 		try {
 			content = fs.readFileSync(filePath, "utf-8");
@@ -630,6 +665,11 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 		}
 
 		const parsedMaxSubagentDepth = Number(frontmatter.maxSubagentDepth);
+		const completionGuard = frontmatter.completionGuard === "false"
+			? false
+			: frontmatter.completionGuard === "true"
+				? true
+				: undefined;
 
 		agents.push({
 			name: runtimeName,
@@ -658,6 +698,7 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 				Number.isInteger(parsedMaxSubagentDepth) && parsedMaxSubagentDepth >= 0
 					? parsedMaxSubagentDepth
 					: undefined,
+			completionGuard,
 			extraFields: Object.keys(extraFields).length > 0 ? extraFields : undefined,
 		});
 	}
@@ -665,10 +706,11 @@ function loadAgentsFromDir(dir: string, source: AgentSource): AgentConfig[] {
 	return agents;
 }
 
-function loadChainsFromDir(dir: string, source: AgentSource): ChainConfig[] {
-	const chains: ChainConfig[] = [];
+function loadChainsFromDir(dir: string, source: "user" | "project"): { chains: ChainConfig[]; diagnostics: ChainDiscoveryDiagnostic[] } {
+	const chains = new Map<string, ChainConfig>();
+	const diagnostics: ChainDiscoveryDiagnostic[] = [];
 
-	for (const filePath of listMarkdownFilesRecursive(dir, (fileName) => fileName.endsWith(".chain.md"))) {
+	for (const filePath of listFilesRecursive(dir, (fileName) => fileName.endsWith(".chain.md") || fileName.endsWith(".chain.json"))) {
 		let content: string;
 		try {
 			content = fs.readFileSync(filePath, "utf-8");
@@ -677,13 +719,17 @@ function loadChainsFromDir(dir: string, source: AgentSource): ChainConfig[] {
 		}
 
 		try {
-			chains.push(parseChain(content, source, filePath));
-		} catch {
+			const chain = filePath.endsWith(".chain.json") ? parseJsonChain(content, source, filePath) : parseChain(content, source, filePath);
+			const existing = chains.get(chain.name);
+			if (existing && existing.filePath.endsWith(".chain.json") && filePath.endsWith(".chain.md")) continue;
+			chains.set(chain.name, chain);
+		} catch (error) {
+			diagnostics.push({ source, filePath, error: error instanceof Error ? error.message : String(error) });
 			continue;
 		}
 	}
 
-	return chains;
+	return { chains: Array.from(chains.values()), diagnostics };
 }
 
 function isDirectory(p: string): boolean {
@@ -723,7 +769,7 @@ function resolveNearestProjectChainDirs(cwd: string): { readDirs: string[]; pref
 const BUILTIN_AGENTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "agents");
 
 export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
-	const userDirOld = path.join(os.homedir(), ".pi", "agent", "agents");
+	const userDirOld = path.join(getAgentDir(), "agents");
 	const userDirNew = path.join(os.homedir(), ".agents");
 	const { readDirs: projectAgentDirs, preferredDir: projectAgentsDir } = resolveNearestProjectAgentDirs(cwd);
 	const userSettingsPath = getUserAgentSettingsPath();
@@ -755,6 +801,7 @@ export function discoverAgentsAll(cwd: string): {
 	user: AgentConfig[];
 	project: AgentConfig[];
 	chains: ChainConfig[];
+	chainDiagnostics: ChainDiscoveryDiagnostic[];
 	userDir: string;
 	projectDir: string | null;
 	userChainDir: string;
@@ -762,7 +809,7 @@ export function discoverAgentsAll(cwd: string): {
 	userSettingsPath: string;
 	projectSettingsPath: string | null;
 } {
-	const userDirOld = path.join(os.homedir(), ".pi", "agent", "agents");
+	const userDirOld = path.join(getAgentDir(), "agents");
 	const userDirNew = path.join(os.homedir(), ".agents");
 	const userChainDir = getUserChainDir();
 	const { readDirs: projectDirs, preferredDir: projectDir } = resolveNearestProjectAgentDirs(cwd);
@@ -792,17 +839,25 @@ export function discoverAgentsAll(cwd: string): {
 	const project = Array.from(projectMap.values());
 
 	const chainMap = new Map<string, ChainConfig>();
+	const projectChainDiagnostics: ChainDiscoveryDiagnostic[] = [];
 	for (const dir of projectChainDirs) {
-		for (const chain of loadChainsFromDir(dir, "project")) {
+		const loaded = loadChainsFromDir(dir, "project");
+		projectChainDiagnostics.push(...loaded.diagnostics);
+		for (const chain of loaded.chains) {
 			chainMap.set(chain.name, chain);
 		}
 	}
+	const userChains = loadChainsFromDir(userChainDir, "user");
 	const chains = [
-		...loadChainsFromDir(userChainDir, "user"),
+		...userChains.chains,
 		...Array.from(chainMap.values()),
 	];
+	const chainDiagnostics = [
+		...userChains.diagnostics,
+		...projectChainDiagnostics,
+	];
 
-	const userDir = fs.existsSync(userDirNew) ? userDirNew : userDirOld;
+	const userDir = process.env.PI_CODING_AGENT_DIR ? userDirOld : fs.existsSync(userDirNew) ? userDirNew : userDirOld;
 
-	return { builtin, user, project, chains, userDir, projectDir, userChainDir, projectChainDir, userSettingsPath, projectSettingsPath };
+	return { builtin, user, project, chains, chainDiagnostics, userDir, projectDir, userChainDir, projectChainDir, userSettingsPath, projectSettingsPath };
 }

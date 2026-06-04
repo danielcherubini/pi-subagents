@@ -291,9 +291,22 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.equal(chainItem.anyOf, undefined);
 		assert.equal(chainItem.oneOf, undefined);
 		assert.equal(chainItem.properties?.agent?.type, "string");
-		assert.equal(chainItem.properties?.parallel?.type, "array");
-		const chainParallelTask = (chainItem.properties?.parallel?.items as { properties?: Record<string, JsonSchemaNode> } | undefined)?.properties;
-		assert.equal(chainParallelTask?.agent?.type, "string");
+		assert.equal(chainItem.properties?.phase?.type, "string");
+		assert.equal(chainItem.properties?.label?.type, "string");
+		assert.equal(chainItem.properties?.as?.type, "string");
+		assert.equal(chainItem.properties?.outputSchema?.type, "object");
+			assert.equal(chainItem.properties?.parallel?.type, undefined);
+			const parallelBranches = anyOfBranches(chainItem.properties?.parallel);
+			const staticParallelBranch = parallelBranches.find((branch) => branch.type === "array");
+			const dynamicParallelBranch = parallelBranches.find((branch) => branch.type === "object");
+			assert.ok(staticParallelBranch, "parallel should support static task arrays");
+			assert.ok(dynamicParallelBranch, "parallel should support a dynamic task template object");
+			const chainParallelTask = (staticParallelBranch.items as { properties?: Record<string, JsonSchemaNode> } | undefined)?.properties;
+			assert.equal(chainParallelTask?.agent?.type, "string");
+		assert.equal(chainParallelTask?.phase?.type, "string");
+		assert.equal(chainParallelTask?.label?.type, "string");
+		assert.equal(chainParallelTask?.as?.type, "string");
+		assert.equal(chainParallelTask?.outputSchema?.type, "object");
 		const chainParallelOutputSchema = chainParallelTask?.output;
 		assert.equal(chainParallelOutputSchema?.type, undefined);
 		assert.equal(hasAnyOfType(chainParallelOutputSchema, "string"), true);
@@ -301,7 +314,9 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		const chainParallelReadsSchema = chainParallelTask?.reads;
 		assert.equal(chainParallelReadsSchema?.type, undefined);
 		assert.equal(hasAnyOfArrayWithStringItems(chainParallelReadsSchema), true);
-		assert.equal(hasAnyOfType(chainParallelReadsSchema, "boolean"), true);
+			assert.equal(hasAnyOfType(chainParallelReadsSchema, "boolean"), true);
+			assert.equal(chainItem.properties?.expand?.type, "object");
+			assert.equal(chainItem.properties?.collect?.type, "object");
 		const chainParallelSkillSchema = chainParallelTask?.skill;
 		assert.equal(chainParallelSkillSchema?.type, undefined);
 		assert.equal(hasAnyOfArrayWithStringItems(chainParallelSkillSchema), true);
@@ -329,10 +344,15 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 			{ tasks: [{ agent: "reviewer", task: "check this", skill: false }] },
 			{ tasks: [{ agent: "reviewer", task: "check this", output: "review.md", reads: ["input.md"], progress: true }] },
 			{ chain: [{ agent: "reviewer", reads: false }] },
+			{ chain: [{ agent: "reviewer", phase: "Review", label: "Correctness", as: "findings", outputSchema: { type: "object" } }] },
 			{ chain: [{ agent: "reviewer", skill: "review" }] },
 			{ chain: [{ agent: "reviewer", skill: false }] },
 			{ chain: [{ parallel: [{ agent: "reviewer", reads: false, skill: false }] }] },
+			{ chain: [{ parallel: [{ agent: "reviewer", phase: "Review", label: "Security", as: "security", outputSchema: { type: "object" } }] }] },
 			{ chain: [{ parallel: [{ agent: "reviewer", output: "review.md", reads: ["input.md"], skill: "review" }] }] },
+			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 }, parallel: { agent: "reviewer", task: "Review {target.path}", outputSchema: { type: "object" } }, collect: { as: "reviews" } }] },
+			{ agent: "worker", task: "Fix", acceptance: false },
+			{ agent: "worker", task: "Fix", acceptance: { level: "checked", review: false } },
 			{ config: { name: "reviewer", description: "Review things" } },
 			{ config: JSON.stringify({ name: "reviewer", description: "Review things" }) },
 		];
@@ -344,6 +364,15 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 			{ chain: [{ parallel: [{ agent: "reviewer", output: 123 }] }] },
 			{ chain: [{ parallel: [{ agent: "reviewer", reads: "input.md" }] }] },
 			{ chain: [{ parallel: [{ agent: "reviewer", skill: 123 }] }] },
+			{ chain: [{ agent: "reviewer", outputSchema: "schema.json" }] },
+			{ chain: [{ parallel: [{ agent: "reviewer", outputSchema: "schema.json" }] }] },
+			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, maxItems: 4 }, parallel: [{ agent: "reviewer" }], collect: { as: "reviews" } }] },
+			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, maxItems: 4 }, parallel: { agent: "reviewer" } }] },
+			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, maxItems: 4, expression: "items" }, parallel: { agent: "reviewer" }, collect: { as: "reviews" } }] },
+			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, maxItems: 4 }, parallel: { agent: "reviewer", as: "child" }, collect: { as: "reviews" } }] },
+			{ chain: [{ expand: { from: { output: "targets", path: "/items" }, maxItems: 4 }, parallel: { agent: "reviewer" }, collect: { as: "reviews" }, when: "later" }] },
+			{ agent: "worker", task: "Fix", acceptance: true },
+			{ agent: "worker", task: "Fix", acceptance: { level: "checked", review: true } },
 			{ config: [] },
 			{ config: null },
 		];

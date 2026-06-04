@@ -571,6 +571,33 @@ Review {previous}
 		});
 	});
 
+	it("/run-chain launches a saved JSON chain with dynamic fanout", async () => {
+		await withTempProject("pi-run-chain-json-dynamic-", async (root) => {
+			writeProjectChain(root, "dynamic-review.chain.json", JSON.stringify({
+				name: "dynamic-review",
+				description: "Dynamic review flow",
+				chain: [
+					{ agent: "scout", task: "Return targets", as: "targets", outputSchema: { type: "object" } },
+					{
+						expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 },
+						parallel: { agent: "reviewer", task: "Review {target.path}", outputSchema: { type: "object" } },
+						collect: { as: "reviews" },
+					},
+				],
+			}));
+
+			const { params } = await captureSlashCommandParams("run-chain", "dynamic-review -- Audit", root);
+			const runParams = params as { chain?: Array<Record<string, unknown>>; task?: string; clarify?: boolean; agentScope?: string };
+
+			assert.equal(runParams.task, "Audit");
+			assert.equal(runParams.clarify, false);
+			assert.equal(runParams.agentScope, "both");
+			assert.equal(runParams.chain?.[0]?.agent, "scout");
+			assert.deepEqual(runParams.chain?.[1]?.expand, { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 });
+			assert.deepEqual(runParams.chain?.[1]?.collect, { as: "reviews" });
+		});
+	});
+
 	it("/run-chain launches and completes packaged saved chains by dotted runtime name", async () => {
 		await withTempProject("pi-run-chain-packaged-", async (root) => {
 			writeProjectChain(root, "code-analysis.review-flow.chain.md", `---
@@ -729,6 +756,31 @@ User chain task
 			});
 
 			assert.equal((params as { chain?: Array<{ task?: string }> }).chain?.[0]?.task, "Project chain task");
+		});
+	});
+
+	it("/run-chain resolves saved outputSchema files at the command boundary", async () => {
+		await withTempProject("pi-run-chain-schema-", async (root) => {
+			const schemasDir = path.join(root, ".pi", "chains", "schemas");
+			fs.mkdirSync(schemasDir, { recursive: true });
+			fs.writeFileSync(path.join(schemasDir, "finding.schema.json"), JSON.stringify({ type: "object", properties: { ok: { type: "boolean" } } }), "utf-8");
+			writeProjectChain(root, "schema-flow.chain.md", `---
+name: schema-flow
+description: Schema flow
+---
+
+## scout
+outputSchema: ./schemas/finding.schema.json
+
+Gather context
+`);
+
+			const { params } = await captureSlashCommandParams("run-chain", "schema-flow -- Shared task", root);
+
+			assert.deepEqual((params as { chain?: Array<{ outputSchema?: unknown }> }).chain?.[0]?.outputSchema, {
+				type: "object",
+				properties: { ok: { type: "boolean" } },
+			});
 		});
 	});
 

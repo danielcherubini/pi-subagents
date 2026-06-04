@@ -3,7 +3,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, unlinkSync } from "node:fs";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentConfig } from "../../agents/agents.ts";
 import {
@@ -46,6 +46,7 @@ import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
+import { readStructuredOutput } from "../shared/structured-output.ts";
 import { captureSingleOutputSnapshot, formatSavedOutputReference, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	buildModelCandidates,
@@ -63,8 +64,10 @@ import {
 	shouldEscalateMutatingFailures,
 	summarizeRecentMutatingFailures,
 } from "../shared/long-running-guard.ts";
+import { acceptanceFailureMessage, evaluateAcceptance, formatAcceptancePrompt, resolveEffectiveAcceptance, stripAcceptanceReport } from "../shared/acceptance.ts";
 
 const artifactOutputByResult = new WeakMap<SingleResult, string>();
+const acceptanceOutputByResult = new WeakMap<SingleResult, string>();
 
 function emptyUsage(): Usage {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
@@ -84,6 +87,17 @@ function appendRecentOutput(progress: AgentProgress, lines: string[]): void {
 	progress.recentOutput.push(...lines.filter((line) => line.trim()));
 	if (progress.recentOutput.length > 50) {
 		progress.recentOutput.splice(0, progress.recentOutput.length - 50);
+	}
+}
+
+function stripAcceptanceReportsFromMessages(messages: Message[] | undefined): void {
+	for (const message of messages ?? []) {
+		if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+		for (const part of message.content) {
+			if (part.type === "text" && "text" in part && typeof part.text === "string") {
+				part.text = stripAcceptanceReport(part.text);
+			}
+		}
 	}
 }
 
@@ -133,10 +147,11 @@ async function runSingleAttempt(
 		artifactPaths?: ArtifactPaths;
 		attemptNotes: string[];
 		outputSnapshot?: SingleOutputSnapshot;
+		originalTask?: string;
 	},
 ): Promise<SingleResult> {
 	const modelArg = applyThinkingSuffix(model, agent.thinking);
-	const { args, env: sharedEnv, tempDir } = buildPiArgs({
+		const { args, env: sharedEnv, tempDir } = buildPiArgs({
 		baseArgs: ["--mode", "json", "-p"],
 		task,
 		sessionEnabled: shared.sessionEnabled,
@@ -151,17 +166,23 @@ async function runSingleAttempt(
 		extensions: agent.extensions,
 		systemPrompt: shared.systemPrompt,
 		mcpDirectTools: agent.mcpDirectTools,
+		cwd: options.cwd ?? runtimeCwd,
 		promptFileStem: agent.name,
 		intercomSessionName: options.intercomSessionName,
 		orchestratorIntercomTarget: options.orchestratorIntercomTarget,
 		runId: options.runId,
 		childAgentName: agent.name,
 		childIndex: options.index ?? 0,
-	});
+		parentEventSink: options.nestedRoute?.eventSink,
+		parentControlInbox: options.nestedRoute?.controlInbox,
+			parentRootRunId: options.nestedRoute?.rootRunId,
+			parentCapabilityToken: options.nestedRoute?.capabilityToken,
+			structuredOutput: options.structuredOutput,
+		});
 
 	const result: SingleResult = {
 		agent: agent.name,
-		task,
+		task: shared.originalTask ?? task,
 		exitCode: 0,
 		messages: [],
 		usage: emptyUsage(),
@@ -171,6 +192,13 @@ async function runSingleAttempt(
 		skillsWarning: shared.skillsWarning,
 	};
 	const startTime = Date.now();
+	if (options.structuredOutput) {
+		try {
+			if (existsSync(options.structuredOutput.outputPath)) unlinkSync(options.structuredOutput.outputPath);
+		} catch {
+			// Missing/stale structured-output files are handled after the child exits.
+		}
+	}
 	const controlConfig = options.controlConfig ?? DEFAULT_CONTROL_CONFIG;
 	let interruptedByControl = false;
 	const allControlEvents: ControlEvent[] = [];
@@ -208,6 +236,7 @@ async function runSingleAttempt(
 			cwd: options.cwd ?? runtimeCwd,
 			env: spawnEnv,
 			stdio: ["ignore", "pipe", "pipe"],
+			windowsHide: true,
 		});
 		const jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
 		let buf = "";
@@ -215,6 +244,7 @@ async function runSingleAttempt(
 		let settled = false;
 		let detached = false;
 		let intercomStarted = false;
+		let assistantError: string | undefined;
 		let removeAbortListener: (() => void) | undefined;
 		let removeInterruptListener: (() => void) | undefined;
 		let activityTimer: NodeJS.Timeout | undefined;
@@ -260,7 +290,7 @@ async function runSingleAttempt(
 				const termSent = trySignalChild(proc, "SIGTERM");
 				if (!termSent) return;
 				forcedTerminationSignal = true;
-				if (!cleanTerminalAssistantStopReceived) {
+				if (!cleanTerminalAssistantStopReceived && !assistantError) {
 					result.error = result.error ?? `Subagent process did not exit within ${FINAL_STOP_GRACE_MS}ms after its final message. Forcing termination.`;
 				}
 				finalHardKillTimer = setTimeout(() => {
@@ -466,13 +496,15 @@ async function runSingleAttempt(
 						progress.tokens = result.usage.input + result.usage.output;
 					}
 					if (!result.model && evt.message.model) result.model = evt.message.model;
-					if (evt.message.errorMessage) result.error = evt.message.errorMessage;
-					appendRecentOutput(progress, extractTextFromContent(evt.message.content).split("\n").slice(-10));
+					if (evt.message.errorMessage) assistantError = evt.message.errorMessage;
+					const assistantText = extractTextFromContent(evt.message.content);
+					appendRecentOutput(progress, assistantText.split("\n").slice(-10));
 					// Final assistant message: start the exit drain window.
 					const stopReason = (evt.message as { stopReason?: string }).stopReason;
 					const hasToolCall = Array.isArray(evt.message.content)
 						&& evt.message.content.some((part) => (part as { type?: string }).type === "toolCall");
 					if (stopReason === "stop" && !hasToolCall) {
+						if (!evt.message.errorMessage && assistantText.trim()) assistantError = undefined;
 						cleanTerminalAssistantStopReceived ||= !evt.message.errorMessage;
 						startFinalDrain();
 					}
@@ -552,6 +584,7 @@ async function runSingleAttempt(
 			}
 			processClosed = true;
 			if (buf.trim()) processLine(buf);
+			if (!result.error && assistantError) result.error = assistantError;
 			const forcedDrainAfterFinalSuccess = forcedTerminationSignal && cleanTerminalAssistantStopReceived && !result.error;
 			if (code !== 0 && stderrBuf.trim() && !result.error && !forcedDrainAfterFinalSuccess) {
 				result.error = stderrBuf.trim();
@@ -646,6 +679,21 @@ async function runSingleAttempt(
 				: `${errInfo.errorType} failed with exit code ${errInfo.exitCode}`;
 		}
 	}
+	if (options.structuredOutput && result.exitCode === 0 && !result.error) {
+		const structured = readStructuredOutput({
+			schema: options.structuredOutput.schema,
+			schemaPath: options.structuredOutput.schemaPath,
+			outputPath: options.structuredOutput.outputPath,
+		});
+		result.structuredOutputSchemaPath = options.structuredOutput.schemaPath;
+		result.structuredOutputPath = options.structuredOutput.outputPath;
+		if (structured.error) {
+			result.exitCode = 1;
+			result.error = structured.error;
+		} else {
+			result.structuredOutput = structured.value;
+		}
+	}
 
 	progress.status = result.exitCode === 0 ? "completed" : "failed";
 	progress.durationMs = Date.now() - startTime;
@@ -662,9 +710,16 @@ async function runSingleAttempt(
 		durationMs: progress.durationMs,
 	};
 
-	let fullOutput = getFinalOutput(result.messages);
-	const completionGuard = result.exitCode === 0 && !result.error
-		? evaluateCompletionMutationGuard({ agent: agent.name, task, messages: result.messages })
+		const acceptanceOutput = getFinalOutput(result.messages);
+		let fullOutput = stripAcceptanceReport(acceptanceOutput);
+	const completionGuard = result.exitCode === 0 && !result.error && agent.completionGuard !== false
+		? evaluateCompletionMutationGuard({
+			agent: agent.name,
+			task: shared.originalTask ?? task,
+			messages: result.messages,
+			tools: agent.tools,
+			mcpDirectTools: agent.mcpDirectTools,
+		})
 		: undefined;
 	if (completionGuard?.triggered && !observedMutationAttempt) {
 		result.exitCode = 1;
@@ -682,16 +737,17 @@ async function runSingleAttempt(
 			reason: "completion_guard",
 		}));
 	}
-	if (options.outputPath && result.exitCode === 0) {
-		const resolvedOutput = resolveSingleOutput(options.outputPath, fullOutput, shared.outputSnapshot);
-		fullOutput = resolvedOutput.fullOutput;
-		result.savedOutputPath = resolvedOutput.savedPath;
-		result.outputSaveError = resolvedOutput.saveError;
-		if (resolvedOutput.savedPath) {
-			result.outputReference = formatSavedOutputReference(resolvedOutput.savedPath, fullOutput);
-		}
+		if (options.outputPath && result.exitCode === 0) {
+			const resolvedOutput = resolveSingleOutput(options.outputPath, fullOutput, shared.outputSnapshot);
+			fullOutput = stripAcceptanceReport(resolvedOutput.fullOutput);
+			result.savedOutputPath = resolvedOutput.savedPath;
+			result.outputSaveError = resolvedOutput.saveError;
+			if (resolvedOutput.savedPath) {
+				result.outputReference = formatSavedOutputReference(resolvedOutput.savedPath, fullOutput);
+			}
 	}
-	artifactOutputByResult.set(result, fullOutput);
+		artifactOutputByResult.set(result, fullOutput);
+		acceptanceOutputByResult.set(result, acceptanceOutput);
 	result.outputMode = options.outputMode ?? "inline";
 	result.finalOutput = options.outputMode === "file-only" && result.savedOutputPath && result.outputReference
 		? result.outputReference.message
@@ -749,6 +805,17 @@ export async function runSync(
 	}
 
 	const shareEnabled = options.share === true;
+	const effectiveAcceptance = resolveEffectiveAcceptance({
+		explicit: options.acceptance,
+		agentName,
+		task,
+		mode: options.acceptanceContext?.mode ?? "single",
+		async: options.acceptanceContext?.async,
+		dynamic: options.acceptanceContext?.dynamic,
+		dynamicGroup: options.acceptanceContext?.dynamicGroup,
+	});
+	const acceptancePrompt = formatAcceptancePrompt(effectiveAcceptance);
+	const taskWithAcceptance = acceptancePrompt ? `${task}\n${acceptancePrompt}` : task;
 	const sessionEnabled = Boolean(options.sessionFile || options.sessionDir) || shareEnabled;
 	const skillNames = options.skills ?? agent.skills ?? [];
 	const skillCwd = options.cwd ?? runtimeCwd;
@@ -788,7 +855,7 @@ export async function runSync(
 		artifactPathsResult = getArtifactPaths(options.artifactsDir, options.runId, agentName, options.index);
 		ensureArtifactsDir(options.artifactsDir);
 		if (options.artifactConfig?.includeInput !== false) {
-			writeArtifact(artifactPathsResult.inputPath, `# Task for ${agentName}\n\n${task}`);
+				writeArtifact(artifactPathsResult.inputPath, `# Task for ${agentName}\n\n${taskWithAcceptance}`);
 		}
 		if (options.artifactConfig?.includeJsonl !== false) {
 			jsonlPath = artifactPathsResult.jsonlPath;
@@ -801,7 +868,7 @@ export async function runSync(
 		const candidate = modelsToTry[i];
 		if (candidate) attemptedModels.push(candidate);
 		const outputSnapshot = captureSingleOutputSnapshot(options.outputPath);
-		const result = await runSingleAttempt(runtimeCwd, agent, task, candidate, options, {
+		const result = await runSingleAttempt(runtimeCwd, agent, taskWithAcceptance, candidate, options, {
 			sessionEnabled,
 			systemPrompt,
 			resolvedSkillNames: resolvedSkills.length > 0 ? resolvedSkills.map((skill) => skill.name) : undefined,
@@ -810,6 +877,7 @@ export async function runSync(
 			artifactPaths: artifactPathsResult,
 			attemptNotes,
 			outputSnapshot,
+			originalTask: task,
 		});
 		lastResult = result;
 		sumUsage(aggregateUsage, result.usage);
@@ -897,6 +965,22 @@ export async function runSync(
 	} else if (shareEnabled && options.sessionDir) {
 		const sessionFile = findLatestSessionFile(options.sessionDir);
 		if (sessionFile) result.sessionFile = sessionFile;
+	}
+
+		result.acceptance = await evaluateAcceptance({
+			acceptance: effectiveAcceptance,
+			output: acceptanceOutputByResult.get(result) ?? result.finalOutput ?? "",
+			cwd: options.cwd ?? runtimeCwd,
+		});
+		const acceptanceFailure = acceptanceFailureMessage(result.acceptance);
+		stripAcceptanceReportsFromMessages(result.messages);
+		if (acceptanceFailure && result.acceptance.explicit && result.exitCode === 0 && !result.detached && !result.interrupted) {
+		result.exitCode = 1;
+		result.error = result.error ? `${result.error}\n${acceptanceFailure}` : acceptanceFailure;
+		if (result.progress) {
+			result.progress.status = "failed";
+			result.progress.error = result.error;
+		}
 	}
 
 	return result;

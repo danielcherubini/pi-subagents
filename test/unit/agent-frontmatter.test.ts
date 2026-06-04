@@ -66,6 +66,103 @@ Do work
 	});
 });
 
+describe("chain discovery", () => {
+	it("prefers same-scope .chain.json over .chain.md for the same runtime name", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-chain-format-precedence-"));
+		tempDirs.push(dir);
+		const chainsDir = path.join(dir, ".pi", "chains");
+		fs.mkdirSync(chainsDir, { recursive: true });
+		fs.writeFileSync(path.join(chainsDir, "dynamic-review.chain.md"), `---
+name: dynamic-review
+description: Markdown fallback
+---
+
+## scout
+
+Run the markdown chain
+`, "utf-8");
+		fs.writeFileSync(path.join(chainsDir, "dynamic-review.chain.json"), JSON.stringify({
+			name: "dynamic-review",
+			description: "JSON dynamic chain",
+			chain: [
+				{
+					agent: "scout",
+					task: "Return targets",
+					as: "targets",
+					outputSchema: { type: "object" },
+				},
+				{
+					expand: { from: { output: "targets", path: "/items" }, maxItems: 4 },
+					parallel: { agent: "reviewer", task: "Review {item.path}" },
+					collect: { as: "reviews" },
+				},
+			],
+		}), "utf-8");
+
+		const result = discoverAgentsAll(dir);
+		const chain = result.chains.find((candidate) => candidate.name === "dynamic-review");
+		assert.equal(chain?.description, "JSON dynamic chain");
+		assert.equal(chain?.filePath.endsWith(".chain.json"), true);
+		assert.equal("expand" in (chain?.steps[1] ?? {}), true);
+	});
+});
+
+describe("agent frontmatter completionGuard", () => {
+	it("serializes disabled completion guard into agent frontmatter", () => {
+		const agent: AgentConfig = {
+			name: "test-runner",
+			description: "Test runner",
+			systemPrompt: "Validate changes",
+			systemPromptMode: "replace",
+			inheritProjectContext: false,
+			inheritSkills: false,
+			source: "project",
+			filePath: "/tmp/test-runner.md",
+			completionGuard: false,
+		};
+
+		const serialized = serializeAgent(agent);
+		assert.match(serialized, /completionGuard: false/);
+	});
+
+	it("omits enabled completion guard from serialized frontmatter", () => {
+		const agent: AgentConfig = {
+			name: "test-runner",
+			description: "Test runner",
+			systemPrompt: "Validate changes",
+			systemPromptMode: "replace",
+			inheritProjectContext: false,
+			inheritSkills: false,
+			source: "project",
+			filePath: "/tmp/test-runner.md",
+			completionGuard: true,
+		};
+
+		const serialized = serializeAgent(agent);
+		assert.doesNotMatch(serialized, /completionGuard:/);
+	});
+
+	it("parses completionGuard from discovered agent frontmatter", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-completion-guard-"));
+		tempDirs.push(dir);
+		const agentsDir = path.join(dir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(path.join(agentsDir, "test-runner.md"), `---
+name: test-runner
+description: Test runner
+completionGuard: false
+---
+
+Validate changes
+`, "utf-8");
+
+		const result = discoverAgents(dir, "project");
+		const runner = result.agents.find((agent) => agent.name === "test-runner");
+		assert.equal(runner?.completionGuard, false);
+		assert.equal(runner?.extraFields?.completionGuard, undefined);
+	});
+});
+
 describe("agent frontmatter maxSubagentDepth", () => {
 	it("serializes maxSubagentDepth into agent frontmatter", () => {
 		const agent: AgentConfig = {

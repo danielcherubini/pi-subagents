@@ -19,11 +19,13 @@ Use the `subagent` tool in chain mode:
 
 2. Second step: a synthesis `context-builder` that reads the parallel findings and writes the final handoff plan and meta-prompt.
 
-Use distinct output paths under the chain directory. Example outputs:
+Use distinct output paths, `label` values, and `as` names under the chain directory. Example outputs:
 - `handoff/external-reference.md`
 - `handoff/local-context.md`
 - `handoff/implementation-strategy.md`
 - `handoff/final-handoff-plan.md`
+
+Use phases such as `Research`, `Local context`, and `Synthesis` so async status is readable. Prefer `{outputs.externalReference}`, `{outputs.localContext}`, and `{outputs.implementationStrategy}` in the synthesis task when those specific inputs are available; keep `{previous}` only when the whole parallel fan-in summary is the desired input.
 
 Do not write these artifacts into the repository unless I explicitly ask for persistent files.
 

@@ -54,6 +54,47 @@ function defaultAssistantMessage(output) {
 	};
 }
 
+function taskRequestsAcceptance(args) {
+	for (const arg of args) {
+		if (typeof arg !== "string") continue;
+		if (arg.includes("## Acceptance Contract")) return true;
+		if (!arg.startsWith("@")) continue;
+		try {
+			if (fs.readFileSync(arg.slice(1), "utf-8").includes("## Acceptance Contract")) return true;
+		} catch {
+			// Ignore unreadable temp prompt references in the mock harness.
+		}
+	}
+	return false;
+}
+
+function defaultAcceptanceReport() {
+	return [
+		"```acceptance-report",
+		JSON.stringify({
+			criteriaSatisfied: [
+				{ id: "criterion-1", status: "satisfied", evidence: "mock acceptance evidence" },
+				{ id: "criterion-2", status: "satisfied", evidence: "mock acceptance evidence" },
+			],
+			changedFiles: ["mock-file.ts"],
+			testsAddedOrUpdated: ["mock-file.test.ts"],
+			commandsRun: [{ command: "mock validation", result: "passed", summary: "passed" }],
+			validationOutput: ["mock validation passed"],
+			residualRisks: [],
+			noStagedFiles: true,
+			reviewFindings: [],
+			manualNotes: "mock run completed",
+			notes: "mock run completed",
+		}),
+		"```",
+	].join("\n");
+}
+
+function withAcceptanceReport(output, args) {
+	if (!taskRequestsAcceptance(args) || output.includes("```acceptance-report")) return output;
+	return `${output}\n${defaultAcceptanceReport()}`;
+}
+
 function defaultResponse() {
 	return { output: "ok", exitCode: 0 };
 }
@@ -78,9 +119,14 @@ function writeSessionFile(args) {
 	}
 }
 
-function writeJsonlLine(entry) {
+async function writeStdout(text) {
+	if (process.stdout.write(text)) return;
+	await new Promise((resolve) => process.stdout.once("drain", resolve));
+}
+
+async function writeJsonlLine(entry) {
 	const line = typeof entry === "string" ? entry : JSON.stringify(entry);
-	process.stdout.write(`${line}\n`);
+	await writeStdout(`${line}\n`);
 }
 
 function extractPlainText(entry) {
@@ -96,15 +142,43 @@ function extractPlainText(entry) {
 	return "";
 }
 
-function writeResponseEntries(entries, jsonMode) {
+async function writeResponseEntries(entries, jsonMode, args) {
+	let sawProviderError = false;
 	for (const entry of entries) {
+		if (entry?.type === "message_end") {
+			const textPart = entry.message?.content?.find?.((part) => part?.type === "text");
+			const isProviderError = Boolean(entry.message?.errorMessage || entry.message?.stopReason === "error");
+			if (isProviderError) sawProviderError = true;
+			if (!isProviderError && textPart && typeof textPart.text === "string" && (!sawProviderError || textPart.text.trim())) {
+				textPart.text = withAcceptanceReport(textPart.text, args);
+			}
+		}
 		if (jsonMode) {
-			writeJsonlLine(entry);
+			await writeJsonlLine(entry);
 			continue;
 		}
 		const text = extractPlainText(entry);
-		if (text) process.stdout.write(`${text}\n`);
+		if (text) await writeStdout(`${text}\n`);
 	}
+}
+
+async function maybeWriteStructuredOutput(response, jsonMode) {
+	if (!Object.prototype.hasOwnProperty.call(response, "structuredOutput")) return;
+	const outputPath = process.env.PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE;
+	if (!outputPath) return;
+	fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+	fs.writeFileSync(outputPath, JSON.stringify(response.structuredOutput), "utf-8");
+	if (!jsonMode) return;
+	await writeJsonlLine({ type: "tool_execution_start", toolName: "structured_output", args: { value: response.structuredOutput } });
+	await writeJsonlLine({
+		type: "tool_result_end",
+		message: {
+			role: "toolResult",
+			toolName: "structured_output",
+			content: [{ type: "text", text: "Structured output captured." }],
+		},
+	});
+	await writeJsonlLine({ type: "tool_execution_end", toolName: "structured_output" });
 }
 
 async function main() {
@@ -129,24 +203,27 @@ async function main() {
 		for (const step of response.steps) {
 			if (typeof step?.delay === "number" && step.delay > 0) {
 				await new Promise((resolve) => setTimeout(resolve, step.delay));
+				}
+				if (Array.isArray(step?.jsonl) && step.jsonl.length > 0) {
+						await writeResponseEntries(step.jsonl, jsonMode, args);
+				}
+				if (typeof step?.stderr === "string" && step.stderr.length > 0) {
+					process.stderr.write(step.stderr);
+				}
 			}
-			if (Array.isArray(step?.jsonl) && step.jsonl.length > 0) {
-				writeResponseEntries(step.jsonl, jsonMode);
+		} else if (Array.isArray(response.jsonl) && response.jsonl.length > 0) {
+				await writeResponseEntries(response.jsonl, jsonMode, args);
+		} else if (Array.isArray(response.echoEnv) && response.echoEnv.length > 0) {
+			const envSnapshot = Object.fromEntries(response.echoEnv.map((key) => [key, process.env[key] ?? null]));
+				const output = withAcceptanceReport(JSON.stringify(envSnapshot), args);
+				if (jsonMode) await writeJsonlLine(defaultAssistantMessage(output));
+				else await writeStdout(`${output}\n`);
+			} else if (typeof response.output === "string") {
+				const output = withAcceptanceReport(response.output, args);
+				if (jsonMode) await writeJsonlLine(defaultAssistantMessage(output));
+				else await writeStdout(`${output}\n`);
 			}
-			if (typeof step?.stderr === "string" && step.stderr.length > 0) {
-				process.stderr.write(step.stderr);
-			}
-		}
-	} else if (Array.isArray(response.jsonl) && response.jsonl.length > 0) {
-		writeResponseEntries(response.jsonl, jsonMode);
-	} else if (Array.isArray(response.echoEnv) && response.echoEnv.length > 0) {
-		const envSnapshot = Object.fromEntries(response.echoEnv.map((key) => [key, process.env[key] ?? null]));
-		if (jsonMode) writeJsonlLine(defaultAssistantMessage(JSON.stringify(envSnapshot)));
-		else process.stdout.write(`${JSON.stringify(envSnapshot)}\n`);
-	} else if (typeof response.output === "string") {
-		if (jsonMode) writeJsonlLine(defaultAssistantMessage(response.output));
-		else process.stdout.write(`${response.output}\n`);
-	}
+		await maybeWriteStructuredOutput(response, jsonMode);
 
 	if (typeof response.stderr === "string" && response.stderr.length > 0) {
 		process.stderr.write(response.stderr);

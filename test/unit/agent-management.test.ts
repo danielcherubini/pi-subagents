@@ -129,6 +129,113 @@ Inspect
 		assert.doesNotMatch(content, /^package:/m);
 	});
 
+	it("creates agents with completion guard disabled", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const result = handleCreate(
+			{ config: { name: "test-runner", description: "Run tests", scope: "project", tools: "read, grep, bash, ls", completionGuard: false } },
+			ctx,
+		);
+
+		assert.equal(result.isError, false);
+		const filePath = path.join(tempDir, ".pi", "agents", "test-runner.md");
+		const content = fs.readFileSync(filePath, "utf-8");
+		assert.match(content, /^completionGuard: false$/m);
+
+		const got = handleManagementAction("get", { agent: "test-runner" }, ctx);
+		assert.equal(got.isError, false);
+		assert.match(readText(got), /Completion guard: false/);
+	});
+
+	it("rejects non-boolean completion guard config", () => {
+		const result = handleCreate(
+			{ config: { name: "test-runner", description: "Run tests", scope: "project", completionGuard: "false" } },
+			{ cwd: tempDir, modelRegistry: { getAvailable: () => [] } },
+		);
+
+		assert.equal(result.isError, true);
+		assert.match(readText(result), /config\.completionGuard must be a boolean/);
+	});
+
+	it("updates JSON chain descriptions without rewriting them as markdown", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const chainPath = path.join(tempDir, ".pi", "chains", "dynamic-review.chain.json");
+		fs.mkdirSync(path.dirname(chainPath), { recursive: true });
+		fs.writeFileSync(chainPath, JSON.stringify({
+			name: "dynamic-review",
+			description: "Review dynamic targets",
+			chain: [
+				{ agent: "scout", task: "Return targets", as: "targets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 },
+					parallel: { agent: "reviewer", task: "Review {target.path}", outputSchema: { type: "object" } },
+					collect: { as: "reviews" },
+				},
+			],
+		}), "utf-8");
+
+		const updated = handleUpdate({ chainName: "dynamic-review", config: { description: "Updated dynamic review" } }, ctx);
+
+		assert.equal(updated.isError, false);
+		const content = fs.readFileSync(chainPath, "utf-8");
+		assert.doesNotMatch(content, /^---/);
+		const parsed = JSON.parse(content) as { description?: string; chain?: Array<{ collect?: { as?: string } }> };
+		assert.equal(parsed.description, "Updated dynamic review");
+		assert.equal(parsed.chain?.[1]?.collect?.as, "reviews");
+	});
+
+	it("renames and repackages JSON chains while preserving JSON format and extension", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		const chainPath = path.join(tempDir, ".pi", "chains", "dynamic-review.chain.json");
+		fs.mkdirSync(path.dirname(chainPath), { recursive: true });
+		fs.writeFileSync(chainPath, JSON.stringify({
+			name: "dynamic-review",
+			description: "Review dynamic targets",
+			chain: [{ agent: "scout", task: "Return targets" }],
+		}), "utf-8");
+
+		const updated = handleUpdate({ chainName: "dynamic-review", config: { name: "Review Flow", package: "Code Analysis" } }, ctx);
+
+		assert.equal(updated.isError, false);
+		const updatedPath = path.join(tempDir, ".pi", "chains", "code-analysis.review-flow.chain.json");
+		assert.equal(fs.existsSync(chainPath), false);
+		const content = fs.readFileSync(updatedPath, "utf-8");
+		assert.doesNotMatch(content, /^---/);
+		const parsed = JSON.parse(content) as { name?: string; package?: string; chain?: Array<{ agent?: string }> };
+		assert.equal(parsed.name, "review-flow");
+		assert.equal(parsed.package, "code-analysis");
+		assert.equal(parsed.chain?.[0]?.agent, "scout");
+	});
+
+	it("gets dynamic JSON chain details and lists invalid chain diagnostics", () => {
+		const ctx = { cwd: tempDir, modelRegistry: { getAvailable: () => [] } };
+		fs.mkdirSync(path.join(tempDir, ".pi", "chains"), { recursive: true });
+		fs.writeFileSync(path.join(tempDir, ".pi", "chains", "dynamic-review.chain.json"), JSON.stringify({
+			name: "dynamic-review",
+			description: "Review dynamic targets",
+			chain: [
+				{ agent: "scout", task: "Return targets", as: "targets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 },
+					parallel: { agent: "reviewer", task: "Review {target.path}", outputSchema: { type: "object" } },
+					collect: { as: "reviews" },
+				},
+			],
+		}), "utf-8");
+		fs.writeFileSync(path.join(tempDir, ".pi", "chains", "broken.chain.json"), "{", "utf-8");
+
+		const got = handleManagementAction("get", { chainName: "dynamic-review" }, ctx);
+		assert.equal(got.isError, false);
+		assert.match(readText(got), /Dynamic fanout -> reviews/);
+		assert.match(readText(got), /Expand: targets\/items/);
+		assert.match(readText(got), /Agent: reviewer/);
+
+		const listed = handleManagementAction("list", {}, ctx);
+		assert.equal(listed.isError, false);
+		assert.match(readText(listed), /Chain diagnostics:/);
+		assert.match(readText(listed), /broken\.chain\.json/);
+		assert.match(readText(listed), /Invalid JSON chain/);
+	});
+
 	it("creates delegate with its builtin prompt defaults", () => {
 		const result = handleCreate(
 			{ config: { name: "delegate", description: "Delegate helper", scope: "project" } },

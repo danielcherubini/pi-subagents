@@ -24,10 +24,14 @@ interface AsyncExecutionResult {
 
 interface AsyncResultPayload {
 	success: boolean;
+	state?: string;
+	exitCode?: number;
 	sessionId?: string;
 	mode?: string;
 	summary?: string;
-	results: Array<{ output?: string; success?: boolean; error?: string; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }> }>;
+	results: Array<{ output?: string; success?: boolean; error?: string; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; structuredOutput?: unknown; intercomTarget?: string; acceptance?: { status?: string; childReport?: unknown } }>;
+	outputs?: Record<string, { text?: string; structured?: unknown }>;
+	workflowGraph?: { nodes?: Array<{ kind?: string; label?: string; phase?: string; status?: string; error?: string; outputName?: string; structured?: boolean; children?: Array<{ label?: string; outputName?: string; itemKey?: string; status?: string; error?: string }> }> };
 }
 
 interface AsyncStatusPayload {
@@ -37,7 +41,12 @@ interface AsyncStatusPayload {
 	currentPath?: string;
 	state?: string;
 	totalTokens?: { total: number };
+	parallelGroups?: Array<{ start: number; count: number; stepIndex: number }>;
 	steps?: Array<{
+		label?: string;
+		phase?: string;
+		outputName?: string;
+		structured?: boolean;
 		skills?: string[];
 		activityState?: string;
 		currentTool?: string;
@@ -47,6 +56,7 @@ interface AsyncStatusPayload {
 		model?: string;
 		thinking?: string;
 		tokens?: { total: number };
+		acceptance?: { status?: string };
 	}>;
 }
 
@@ -129,6 +139,28 @@ async function waitForAsyncResultFile(id: string, timeoutMs = 15_000): Promise<s
 		await new Promise((resolve) => setTimeout(resolve, 100));
 	}
 	return resultPath;
+}
+
+function readLastMockPiArgs(mockPi: MockPi): string[] {
+	const callFile = fs.readdirSync(mockPi.dir)
+		.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+		.sort()
+		.at(-1);
+	assert.ok(callFile, "expected a recorded mock pi call");
+	const payload = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as { args?: string[] };
+	assert.ok(Array.isArray(payload.args), "expected recorded args");
+	return payload.args;
+}
+
+function readMockPiArgs(mockPi: MockPi, index: number): string[] {
+	const callFile = fs.readdirSync(mockPi.dir)
+		.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+		.sort()
+		.at(index);
+	assert.ok(callFile, `expected recorded call ${index}`);
+	const payload = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as { args?: string[] };
+	assert.ok(Array.isArray(payload.args), "expected recorded args");
+	return payload.args;
 }
 
 describe("async execution utilities", { skip: !available ? "pi packages not available" : undefined }, () => {
@@ -279,9 +311,11 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
 		const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
-		assert.equal(payload.mode, "parallel");
-		assert.equal(payload.sessionId, "session-123");
-		assert.equal(status.sessionId, "session-123");
+			assert.equal(payload.mode, "parallel");
+			assert.equal(payload.sessionId, "session-123");
+			assert.equal(payload.results[0]?.acceptance?.status, "checked");
+			assert.equal(status.sessionId, "session-123");
+			assert.equal(status.steps?.[0]?.acceptance?.status, "checked");
 		const outputPath = path.join(tempDir, "async-top-output.md");
 		const outputDeadline = Date.now() + 5_000;
 		while (!fs.existsSync(outputPath)) {
@@ -299,6 +333,54 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(taskArg.includes(`Update progress at: ${path.join(tempDir, "progress.md")}`));
 		assert.ok(taskArg.includes(`Write your findings to: ${outputPath}`));
 		assert.equal(fs.existsSync(path.join(tempDir, "progress.md")), true);
+	});
+
+	it("async single rejects explicit reviewed acceptance without a reviewer result", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			output: [
+				"implemented",
+				"```acceptance-report",
+				JSON.stringify({
+					criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "patched" }],
+					changedFiles: ["src/file.ts"],
+					testsAddedOrUpdated: ["test/file.test.ts"],
+					commandsRun: [{ command: "npm test", result: "passed", summary: "passed" }],
+					validationOutput: ["passed"],
+					residualRisks: [],
+					noStagedFiles: true,
+					notes: "done",
+				}),
+				"```",
+			].join("\n"),
+		});
+		const artifactConfig = {
+			enabled: false,
+			includeInput: false,
+			includeOutput: false,
+			includeJsonl: false,
+			includeMetadata: false,
+			cleanupDays: 7,
+		};
+		const id = `async-acceptance-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Implement acceptance-covered fix",
+			agentConfig: makeAgent("worker", { completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-acceptance" },
+			artifactConfig,
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			acceptance: { level: "reviewed", criteria: ["Patch bug"], review: false },
+		});
+		const resultPath = await waitForAsyncResultFile(id, 10_000);
+		const result = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+
+		assert.equal(result.success, false);
+		assert.equal(result.results[0]?.acceptance?.status, "rejected");
+		assert.ok(result.results[0]?.acceptance?.childReport);
+		assert.equal(result.results[0]?.acceptance?.reviewResult?.status, "needs-parent-decision");
+		assert.equal(status.steps?.[0]?.acceptance?.status, "rejected");
 	});
 
 	it("top-level async chain suppresses progress for {task} review-only tasks", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
@@ -340,6 +422,258 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const args = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")).args as string[];
 		assert.doesNotMatch(args.at(-1) ?? "", /progress\.md/);
 		assert.equal(fs.existsSync(path.join(tempDir, "progress.md")), false);
+	});
+
+	it("async chains reject malformed named output references before spawning", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const id = `async-malformed-output-ref-${Date.now().toString(36)}`;
+		const result = executeAsyncChain(id, {
+			chain: [{ agent: "consumer", task: "Use {outputs.bad-name}" }],
+			agents: [makeAgent("consumer")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-malformed" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		assert.equal(result.isError, true);
+		assert.match(result.content[0]?.text ?? "", /Invalid chain output reference '\{outputs\.bad-name\}'/);
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("async chains persist structured outputs, named outputs, and graph labels", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		const schema = {
+			type: "object",
+			required: ["value"],
+			properties: { value: { type: "string" } },
+		};
+		mockPi.onCall({ output: "structured prose", structuredOutput: { value: "Alpha structured" } });
+		mockPi.onCall({ output: "used named output" });
+		const id = `async-structured-chain-${Date.now().toString(36)}`;
+		const result = executeAsyncChain(id, {
+			chain: [
+				{
+					agent: "producer",
+					task: "Produce data",
+					phase: "Collect",
+					label: "Produce structured data",
+					as: "data",
+					outputSchema: schema,
+				},
+				{ agent: "consumer", task: "Use {outputs.data}", phase: "Use", label: "Consume data" },
+			],
+			agents: [makeAgent("producer"), makeAgent("consumer")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-structured" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		assert.ok(!result.isError);
+		const resultPath = await waitForAsyncResultFile(id, 10_000);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		assert.deepEqual(payload.results[0]?.structuredOutput, { value: "Alpha structured" });
+		assert.deepEqual(payload.outputs?.data?.structured, { value: "Alpha structured" });
+		assert.match(readMockPiArgs(mockPi, 1).at(-1) ?? "", /Alpha structured/);
+		assert.equal(status.steps?.[0]?.label, "Produce structured data");
+		assert.equal(status.steps?.[0]?.phase, "Collect");
+		assert.equal(status.steps?.[0]?.outputName, "data");
+		assert.equal(status.steps?.[0]?.structured, true);
+		assert.equal(payload.workflowGraph?.nodes?.[0]?.label, "Produce structured data");
+		assert.equal(payload.workflowGraph?.nodes?.[0]?.outputName, "data");
+		assert.equal(payload.workflowGraph?.nodes?.[0]?.status, "completed");
+		assert.equal(payload.workflowGraph?.nodes?.[1]?.status, "completed");
+	});
+
+	it("async dynamic status shows a placeholder before materialization", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ delay: 800, output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }, { path: "src/b.ts" }] } });
+		mockPi.onCall({ output: "review-a", structuredOutput: { ok: "a" } });
+		mockPi.onCall({ output: "review-b", structuredOutput: { ok: "b" } });
+		mockPi.onCall({ output: "used reviews" });
+		const id = `async-dynamic-placeholder-${Date.now().toString(36)}`;
+		const result = executeAsyncChain(id, {
+			chain: [
+				{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 },
+					parallel: { agent: "reviewer", task: "Review {target.path}", label: "Review {target.path}", outputSchema: { type: "object" } },
+					collect: { as: "reviews" },
+					concurrency: 1,
+				},
+				{ agent: "consumer", task: "Use {outputs.reviews}" },
+			],
+			agents: [makeAgent("producer"), makeAgent("reviewer"), makeAgent("consumer")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-dynamic-placeholder" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		assert.ok(!result.isError);
+		const statusPath = path.join(ASYNC_DIR, id, "status.json");
+		const deadline = Date.now() + 5_000;
+		let status: AsyncStatusPayload | undefined;
+		while (!status) {
+			if (Date.now() > deadline) assert.fail(`Timed out waiting for async status file: ${statusPath}`);
+			if (fs.existsSync(statusPath)) status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+			else await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		assert.deepEqual(status.steps?.map((step) => step.agent), ["producer", "expand:reviewer", "consumer"]);
+		assert.equal(status.steps?.[1]?.label, "Review {target.path}");
+		assert.equal(status.steps?.[1]?.outputName, "reviews");
+		assert.deepEqual(status.parallelGroups, [{ start: 1, count: 1, stepIndex: 1 }]);
+
+		const resultPath = await waitForAsyncResultFile(id, 10_000);
+		const finalStatus = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, true);
+		assert.deepEqual(finalStatus.steps?.map((step) => step.agent), ["producer", "reviewer", "reviewer", "consumer"]);
+		assert.deepEqual(finalStatus.parallelGroups, [{ start: 1, count: 2, stepIndex: 1 }]);
+	});
+
+	it("async chains expand dynamic fanout and persist collected output", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }, { path: "src/b.ts" }] } });
+		mockPi.onCall({ output: "review-a", structuredOutput: { ok: "a" } });
+		mockPi.onCall({ output: "review-b", structuredOutput: { ok: "b" } });
+		mockPi.onCall({ output: "used reviews" });
+		const id = `async-dynamic-chain-${Date.now().toString(36)}`;
+		const result = executeAsyncChain(id, {
+			chain: [
+				{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 },
+					parallel: {
+						agent: "reviewer",
+						task: "Review {target.path}",
+						label: "Review {target.path}",
+						outputSchema: { type: "object" },
+				},
+				collect: { as: "reviews" },
+				concurrency: 1,
+				},
+				{ agent: "consumer", task: "Use {outputs.reviews}" },
+			],
+			agents: [makeAgent("producer"), makeAgent("reviewer"), makeAgent("consumer")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-dynamic" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		assert.ok(!result.isError);
+		const resultPath = await waitForAsyncResultFile(id, 10_000);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload;
+		assert.equal(payload.success, true);
+		assert.equal(mockPi.callCount(), 4);
+		assert.match(readMockPiArgs(mockPi, 1).at(-1) ?? "", /Review src\/a\.ts/);
+		assert.match(readMockPiArgs(mockPi, 2).at(-1) ?? "", /Review src\/b\.ts/);
+		assert.match(readMockPiArgs(mockPi, 3).at(-1) ?? "", /"key":"src\/a\.ts"/);
+		const collected = payload.outputs?.reviews?.structured as Array<{ key: string; structured: unknown }>;
+		assert.deepEqual(collected.map((item) => item.key), ["src/a.ts", "src/b.ts"]);
+		assert.deepEqual(collected.map((item) => item.structured), [{ ok: "a" }, { ok: "b" }]);
+		assert.equal(status.steps?.length, 4);
+		assert.deepEqual(status.parallelGroups, [{ start: 1, count: 2, stepIndex: 1 }]);
+		assert.equal(payload.workflowGraph?.nodes?.[1]?.kind, "dynamic-parallel-group");
+		assert.deepEqual(payload.workflowGraph?.nodes?.[1]?.children?.map((child) => child.itemKey), ["src/a.ts", "src/b.ts"]);
+		assert.equal(payload.workflowGraph?.nodes?.[2]?.flatIndex, 3);
+	});
+
+	it("async dynamic fanout recomputes later child intercom targets by final flat index", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }, { path: "src/b.ts" }] } });
+		mockPi.onCall({ output: "review-a", structuredOutput: { ok: "a" } });
+		mockPi.onCall({ output: "review-b", structuredOutput: { ok: "b" } });
+		mockPi.onCall({ echoEnv: ["PI_SUBAGENT_INTERCOM_SESSION_NAME"] });
+		const id = `async-dynamic-targets-${Date.now().toString(36)}`;
+		const result = executeAsyncChain(id, {
+			chain: [
+				{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 },
+					parallel: { agent: "reviewer", task: "Review {target.path}", outputSchema: { type: "object" } },
+					collect: { as: "reviews" },
+					concurrency: 1,
+				},
+				{ agent: "consumer", task: "Use {outputs.reviews}" },
+			],
+			agents: [makeAgent("producer"), makeAgent("reviewer"), makeAgent("consumer")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-dynamic-targets" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			controlIntercomTarget: "subagent-orchestrator-test",
+			childIntercomTarget: (agent: string, index: number) => `subagent-${agent}-${id}-${index + 1}`,
+		});
+
+		assert.ok(!result.isError);
+		const resultPath = await waitForAsyncResultFile(id, 10_000);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const expectedConsumerTarget = `subagent-consumer-${id}-4`;
+		assert.equal(payload.success, true);
+		assert.equal(payload.results[3]?.intercomTarget, expectedConsumerTarget);
+		assert.deepEqual(JSON.parse(payload.results[3]?.output ?? "{}"), { PI_SUBAGENT_INTERCOM_SESSION_NAME: expectedConsumerTarget });
+	});
+
+	it("async dynamic pre-spawn failures persist failed graph status and error", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }, { path: "src/b.ts" }] } });
+		const id = `async-dynamic-prespawn-fail-${Date.now().toString(36)}`;
+		const result = executeAsyncChain(id, {
+			chain: [
+				{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 1 },
+					parallel: { agent: "reviewer", task: "Review {target.path}" },
+					collect: { as: "reviews" },
+				},
+			],
+			agents: [makeAgent("producer"), makeAgent("reviewer")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-dynamic-fail" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		assert.ok(!result.isError);
+		const resultPath = await waitForAsyncResultFile(id, 10_000);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const status = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")) as AsyncStatusPayload & { workflowGraph?: AsyncResultPayload["workflowGraph"]; error?: string };
+		assert.equal(payload.success, false);
+		assert.match(payload.results.at(-1)?.error ?? "", /exceeding maxItems 1/);
+		assert.equal(payload.workflowGraph?.nodes?.[1]?.status, "failed");
+		assert.match(payload.workflowGraph?.nodes?.[1]?.error ?? "", /exceeding maxItems 1/);
+		assert.equal(status.state, "failed");
+		assert.match(status.error ?? "", /exceeding maxItems 1/);
+		assert.equal(status.workflowGraph?.nodes?.[1]?.status, "failed");
+	});
+
+	it("async dynamic collect schema failures persist failed graph status and details", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "targets", structuredOutput: { items: [{ path: "src/a.ts" }] } });
+		mockPi.onCall({ output: "review-a", structuredOutput: { ok: "a" } });
+		const id = `async-dynamic-collect-fail-${Date.now().toString(36)}`;
+		const result = executeAsyncChain(id, {
+			chain: [
+				{ agent: "producer", task: "Produce targets", as: "targets", outputSchema: { type: "object" } },
+				{
+					expand: { from: { output: "targets", path: "/items" }, item: "target", key: "/path", maxItems: 4 },
+					parallel: { agent: "reviewer", task: "Review {target.path}", outputSchema: { type: "object" } },
+					collect: { as: "reviews", outputSchema: { type: "object" } },
+				},
+			],
+			agents: [makeAgent("producer"), makeAgent("reviewer")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-dynamic-collect-fail" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		assert.ok(!result.isError);
+		const resultPath = await waitForAsyncResultFile(id, 10_000);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, false);
+		assert.match(payload.results.at(-1)?.error ?? "", /Collected output validation failed/);
+		assert.ok(Array.isArray(payload.results.at(-1)?.structuredOutput), "failed collect result should preserve ordered collection details");
+		assert.equal(payload.workflowGraph?.nodes?.[1]?.status, "failed");
+		assert.match(payload.workflowGraph?.nodes?.[1]?.error ?? "", /Collected output validation failed/);
 	});
 
 	it("top-level async worktree parallel resolves reads and output against the worktree cwd", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
@@ -539,6 +873,107 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(statusPayload.steps?.[0]?.error ?? "", /429 quota exceeded/);
 	});
 
+	it("background runs treat recovered child errors as successful", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			jsonl: [
+				events.toolResult("read", "EISDIR: illegal operation on a directory", true),
+				{
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "temporary provider failure" }],
+						model: "openai/gpt-5-mini",
+						stopReason: "error",
+						errorMessage: "provider transport failed",
+						usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+					},
+				},
+				events.assistantMessage("Recovered asynchronously"),
+			],
+		});
+		const id = `async-recovered-child-error-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			agentConfig: makeAgent("worker", { model: "openai/gpt-5-mini" }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		const resultPath = await waitForAsyncResultFile(id);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, true);
+		assert.equal(payload.state, "complete");
+		assert.equal(payload.exitCode, 0);
+		assert.equal(payload.results[0]?.success, true);
+		assert.equal(payload.results[0]?.error, undefined);
+		assert.equal(payload.results[0]?.output, "Recovered asynchronously");
+		const statusPayload = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatusPayload;
+		assert.equal(statusPayload.state, "complete");
+		assert.equal(statusPayload.steps?.[0]?.status, "complete");
+		assert.equal(statusPayload.steps?.[0]?.exitCode, 0);
+	});
+
+	it("background runs keep provider errors failed when followed only by empty assistant output", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			jsonl: [
+				{
+					type: "message_end",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: "temporary provider failure" }],
+						model: "openai/gpt-5-mini",
+						stopReason: "error",
+						errorMessage: "provider transport failed",
+						usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
+					},
+				},
+				events.assistantMessage(""),
+			],
+		});
+		const id = `async-provider-error-empty-stop-${Date.now().toString(36)}`;
+		const asyncDir = path.join(ASYNC_DIR, id);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			agentConfig: makeAgent("worker", { model: "openai/gpt-5-mini" }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		const resultPath = await waitForAsyncResultFile(id);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, false);
+		assert.equal(payload.state, "failed");
+		assert.equal(payload.exitCode, 1);
+		assert.equal(payload.results[0]?.success, false);
+		assert.match(payload.results[0]?.error ?? "", /provider transport failed/);
+		assert.equal(payload.results[0]?.output, "");
+		const statusPayload = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatusPayload;
+		assert.equal(statusPayload.state, "failed");
+		assert.equal(statusPayload.steps?.[0]?.status, "failed");
+		assert.equal(statusPayload.steps?.[0]?.exitCode, 1);
+	});
+
 	it("background file-only runs write full output but return only a file reference", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "async full output\nwith details" });
 		const id = `async-file-only-${Date.now().toString(36)}`;
@@ -579,6 +1014,39 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(payload.results[0]?.output ?? "", /Output saved to:/);
 		assert.doesNotMatch(payload.results[0]?.output ?? "", /async full output/);
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "async full output\nwith details");
+	});
+
+	it("background single runs treat string false as disabled output", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "async inline report" });
+		const id = `async-string-false-output-${Date.now().toString(36)}`;
+		const run = executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Do work",
+			agentConfig: makeAgent("worker", { output: "default-report.md" }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			output: "false",
+			maxSubagentDepth: 2,
+		});
+
+		assert.equal(run.details.asyncId, id);
+		const resultPath = await waitForAsyncResultFile(id);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, true);
+		assert.equal(payload.results[0]?.output, "async inline report");
+		assert.doesNotMatch(payload.summary ?? "", /Output saved to:/);
+		assert.equal(fs.existsSync(path.join(tempDir, "false")), false);
+		assert.equal(fs.existsSync(path.join(tempDir, "default-report.md")), false);
+		assert.doesNotMatch(readLastMockPiArgs(mockPi).at(-1) ?? "", /Write your findings to:/);
 	});
 
 	it("background runs detect hidden tool failures even when the child exits 0", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -668,6 +1136,42 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(eventsText, /Subagent failed: worker/);
 		assert.doesNotMatch(eventsText, /Status:/);
 		assert.doesNotMatch(eventsText, /Interrupt:/);
+	});
+
+	it("background bash-enabled non-implementation agents can opt out of the completion guard", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ output: "cold start test after patch" });
+
+		const id = `async-completion-guard-optout-${Date.now().toString(36)}`;
+		const sessionRoot = path.join(tempDir, "sessions");
+
+		executeAsyncSingle(id, {
+			agent: "test-runner",
+			task: "Run cold start test after patch",
+			agentConfig: makeAgent("test-runner", { tools: ["read", "grep", "bash", "ls"], completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			sessionRoot,
+			maxSubagentDepth: 2,
+		});
+
+		const resultPath = await waitForAsyncResultFile(id, 10_000);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8"));
+		assert.equal(payload.success, true);
+		assert.equal(payload.exitCode, 0);
+		assert.equal(payload.results[0].success, true);
+		assert.equal(payload.results[0].output, "cold start test after patch");
+
+		const eventsPath = path.join(ASYNC_DIR, id, "events.jsonl");
+		const eventsText = fs.readFileSync(eventsPath, "utf-8");
+		assert.doesNotMatch(eventsText, /"reason":"completion_guard"/);
 	});
 
 	it("background runs prefer the parent session provider for ambiguous bare model ids", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -1186,7 +1690,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		mockPi.onCall({
 			steps: [
 				{ jsonl: [events.assistantMessage("still working")] },
-				{ delay: 500, jsonl: [events.assistantMessage("done")] },
+				{ delay: 2_000, jsonl: [events.assistantMessage("done")] },
 			],
 		});
 
@@ -1216,21 +1720,32 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			},
 		});
 
+		const statusPath = path.join(asyncDir, "status.json");
 		const deadline = Date.now() + 10_000;
 		let eventText = "";
+		let statusDuringEvent: AsyncStatusPayload | undefined;
 		while (Date.now() < deadline) {
 			if (fs.existsSync(eventsPath)) {
 				eventText = fs.readFileSync(eventsPath, "utf-8");
-				if (eventText.includes('"type":"active_long_running"')) break;
+			}
+			if (eventText.includes('"type":"active_long_running"') && fs.existsSync(statusPath)) {
+				const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+				if (status.activityState === "active_long_running" && status.steps?.[0]?.activityState === "active_long_running") {
+					statusDuringEvent = status;
+					break;
+				}
+			}
+			if (eventText.includes('"type":"active_long_running"') && fs.existsSync(resultPath)) {
+				assert.fail("run completed before status.json exposed active_long_running");
 			}
 			await new Promise((resolve) => setTimeout(resolve, 100));
 		}
 
 		assert.match(eventText, /"type":"active_long_running"/);
 		assert.match(eventText, /"reason":"turn_threshold"/);
-		const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatusPayload;
-		assert.equal(status.activityState, "active_long_running");
-		assert.equal(status.steps?.[0]?.activityState, "active_long_running");
+		assert.ok(statusDuringEvent, "expected status.json to expose active_long_running while the run is still active");
+		assert.equal(statusDuringEvent.activityState, "active_long_running");
+		assert.equal(statusDuringEvent.steps?.[0]?.activityState, "active_long_running");
 
 		const doneDeadline = Date.now() + 10_000;
 		while (!fs.existsSync(resultPath)) {
@@ -1245,7 +1760,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				{ jsonl: [events.toolStart("edit", { path: "src/runs/background/subagent-runner.ts" }), events.toolEnd("edit"), events.toolResult("edit", "No exact match found for subagent-runner.ts", true)] },
 				{ jsonl: [events.toolStart("edit", { path: "src/runs/background/subagent-runner.ts" }), events.toolEnd("edit"), events.toolResult("edit", "No exact match found for subagent-runner.ts", true)] },
 				{ jsonl: [events.toolStart("edit", { path: "src/runs/background/subagent-runner.ts" }), events.toolEnd("edit"), events.toolResult("edit", "No exact match found for subagent-runner.ts", true)] },
-				{ delay: 500, jsonl: [events.assistantMessage("I need another attempt.")] },
+				{ delay: 2_000, jsonl: [events.assistantMessage("I need another attempt.")] },
 			],
 		});
 
@@ -1275,12 +1790,23 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			},
 		});
 
+		const statusPath = path.join(asyncDir, "status.json");
 		const deadline = Date.now() + 10_000;
 		let eventText = "";
+		let statusDuringEvent: AsyncStatusPayload | undefined;
 		while (Date.now() < deadline) {
 			if (fs.existsSync(eventsPath)) {
 				eventText = fs.readFileSync(eventsPath, "utf-8");
-				if (eventText.includes('"reason":"tool_failures"')) break;
+			}
+			if (eventText.includes('"reason":"tool_failures"') && fs.existsSync(statusPath)) {
+				const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+				if (status.activityState === "needs_attention" && status.steps?.[0]?.activityState === "needs_attention") {
+					statusDuringEvent = status;
+					break;
+				}
+			}
+			if (eventText.includes('"reason":"tool_failures"') && fs.existsSync(resultPath)) {
+				assert.fail("run completed before status.json exposed needs_attention");
 			}
 			await new Promise((resolve) => setTimeout(resolve, 100));
 		}
@@ -1288,9 +1814,9 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(eventText, /"type":"needs_attention"/);
 		assert.match(eventText, /"reason":"tool_failures"/);
 		assert.match(eventText, /subagent-runner\.ts/);
-		const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatusPayload;
-		assert.equal(status.activityState, "needs_attention");
-		assert.equal(status.steps?.[0]?.activityState, "needs_attention");
+		assert.ok(statusDuringEvent, "expected status.json to expose needs_attention while the run is still active");
+		assert.equal(statusDuringEvent.activityState, "needs_attention");
+		assert.equal(statusDuringEvent.steps?.[0]?.activityState, "needs_attention");
 
 		const doneDeadline = Date.now() + 10_000;
 		while (!fs.existsSync(resultPath)) {

@@ -1,5 +1,43 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.26.0] - 2026-05-29
+
+### Added
+- Added first-wave acceptance gates with optional public `acceptance` config, inferred effective policies, structured child reports, provenance ledgers, checked evidence gates, explicit runtime verification commands, async/status persistence, and saved `.chain.json` validation.
+- Added chain step metadata (`phase`, `label`), named outputs (`as` with `{outputs.name}`), workflow graph snapshots, and strict `outputSchema` structured-output contracts across foreground and async chain execution.
+- Added dynamic chain fanout with `expand`/single-template `parallel`/`collect`, structured named-output sources, bounded item expansion, collected result outputs, async status graph persistence, and saved `.chain.json` support.
+
+### Fixed
+- Fixed dynamic fanout acceptance blockers around real `structured_output` tool validation, malformed dynamic-like chain rejection, async dynamic failure status/details, dynamic child intercom target indexing, and saved `.chain.json` management diagnostics.
+- Fixed acceptance-gate semantics so reviewed status requires an independent reviewer result, required criteria must be reported as satisfied, only fenced `acceptance-report` blocks satisfy attestation, malformed reports preserve parse errors, `{ level: "none", reason }` disables inferred gates, and zero-child dynamic aggregates no longer fabricate evidence.
+
+## [0.25.0] - 2026-05-21
+
+### Added
+- Allow child agents whose resolved builtin tools explicitly include `subagent` to run child-safe nested fanout, with parent-visible nested status trees and nested `status`/`interrupt`/`resume` by id.
+
+### Fixed
+- Preserve compact nested child summaries in grouped result/intercom payloads and async completion metadata before ordinary result files are processed and deleted.
+- Keep async result files retryable when nested registry enrichment temporarily fails, instead of marking them seen before a successful delivery pass.
+- Require an explicit id for child-safe nested `status` when no local foreground run is active, preventing fanout children from listing unrelated top-level async runs.
+- Keep fanout child control inbox polling alive across transient filesystem errors, and retain control requests for retry when control-result writes fail.
+- Share nested path/env sanitization between child launch arguments and nested event projection.
+
+## [0.24.4] - 2026-05-20
+
+### Fixed
+- Treat provider-coerced single-run `output: "false"` the same as boolean `false`, preventing literal `false` output files in foreground and async runs.
+- Include selected direct MCP tool names in explicit child `--tools` allowlists when metadata cache/config resolution is available.
+- Honor `PI_CODING_AGENT_DIR` for runtime config, agent/chain/settings discovery, skills, run history, artifact cleanup, and intercom defaults.
+- Hide nested child Pi process windows on Windows for both foreground and background subagent runs.
+- Avoid completion-guard false positives for declared read-only agents, and add `completionGuard: false` for bash-enabled non-implementation agents that should not be required to edit files.
+- Skip empty or whitespace-only assistant text parts when selecting subagent final output, so later meaningful text in the same or earlier assistant message is not masked.
+- Declare `@earendil-works/pi-tui` as a runtime dependency so packaged installs can load the extension without relying on dev dependencies or optional peers.
+- Treat recovered intermediate child tool/provider errors as successful when a later clean final assistant response is emitted, preventing false failed subagent results.
+- Use progress-driven spinner frames in subagent result rows and async widgets, avoiding timer-driven off-screen redraw flicker in small terminals.
+
 ## [0.24.3] - 2026-05-14
 
 ### Added
@@ -8,12 +46,6 @@
 
 ### Fixed
 - Let `async: true` chain tool calls run in the background when `clarify` is omitted, and avoid showing the async badge for explicit foreground clarify runs.
-
-## [Unreleased]
-
-### Added
-
-### Fixed
 
 ## [0.24.2] - 2026-05-10
 
